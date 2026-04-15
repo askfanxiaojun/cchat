@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Search and preview Claude Code session transcripts."""
+"""Search and preview local Claude Code and Codex session transcripts."""
 
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable, Optional
 
-DEFAULT_ROOT = Path.home() / ".claude" / "projects"
+DEFAULT_CLAUDE_ROOT = Path.home() / ".claude" / "projects"
+DEFAULT_CODEX_ROOT = Path.home() / ".codex" / "sessions"
 DEFAULT_MAX_RESULTS = 10
 DEFAULT_SNIPPETS = 3
 SNIPPET_WIDTH = 72
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+SOURCE_CHOICES = ("all", "claude", "codex")
 
 
 @dataclass
@@ -29,11 +31,14 @@ class MessageEntry:
 
 @dataclass
 class SessionEntry:
+    source: str
     session_id: str
     project: str
     path: Path
     title: str
     updated_at: datetime
+    resume_command: str
+    cwd: str = ""
     last_prompt: str = ""
     messages: list[MessageEntry] = field(default_factory=list)
 
@@ -41,13 +46,27 @@ class SessionEntry:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog=os.environ.get("CSEARCH_PROG", "csearch"),
-        description="Search and preview Claude Code session JSONL files."
+        description="Search and preview local Claude Code and Codex session JSONL files.",
     )
     parser.add_argument("query", nargs="?", help="Search text.")
     parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default="all",
+        help="Which session source to search. Default: all",
+    )
+    parser.add_argument(
         "--root",
-        default=str(DEFAULT_ROOT),
-        help="Claude projects root directory. Default: ~/.claude/projects",
+        default=str(DEFAULT_CLAUDE_ROOT),
+        help="Legacy alias for --claude-root. Default: ~/.claude/projects",
+    )
+    parser.add_argument(
+        "--claude-root",
+        help="Claude Code session root. Default: ~/.claude/projects",
+    )
+    parser.add_argument(
+        "--codex-root",
+        help="Codex session root. Default: ~/.codex/sessions",
     )
     parser.add_argument(
         "--list",
@@ -56,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--project",
-        help="Only include project directories whose name contains this text.",
+        help="Only include sessions whose project/cwd contains this text.",
     )
     parser.add_argument(
         "--max",
@@ -115,7 +134,7 @@ def colorize(text: str, code: str, enabled: bool) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-def normalize_whitespace(text: str) -> str:
+def normalize_whitespace(text: object) -> str:
     return " ".join(str(text).split())
 
 
@@ -128,7 +147,7 @@ def parse_timestamp(raw: object) -> Optional[datetime]:
         return None
 
 
-def collect_text_blocks(content: object) -> Iterable[str]:
+def collect_claude_text_blocks(content: object) -> Iterable[str]:
     if isinstance(content, str):
         yield content
         return
@@ -149,12 +168,17 @@ def collect_text_blocks(content: object) -> Iterable[str]:
             yield text
 
 
-def fallback_title(session_id: str, last_prompt: str, messages: list[MessageEntry]) -> str:
-    if last_prompt:
-        return truncate_plain(last_prompt, 56)
-    if messages:
-        return truncate_plain(messages[0].text, 56)
-    return f"(untitled) {session_id[:8]}"
+def collect_codex_text_blocks(content: object) -> Iterable[str]:
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") not in {"input_text", "output_text"}:
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text.strip():
+            yield text
 
 
 def truncate_plain(text: str, limit: int) -> str:
@@ -164,7 +188,48 @@ def truncate_plain(text: str, limit: int) -> str:
     return text[: max(0, limit - 1)] + "…"
 
 
-def load_session(path: Path) -> Optional[SessionEntry]:
+def fallback_title(session_id: str, last_prompt: str, messages: list[MessageEntry]) -> str:
+    if last_prompt:
+        return truncate_plain(last_prompt, 56)
+    if messages:
+        return truncate_plain(messages[0].text, 56)
+    return f"(untitled) {session_id[:8]}"
+
+
+def format_time(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def build_resume_command(source: str, session_id: str) -> str:
+    if source == "codex":
+        return f"codex resume {session_id}"
+    return f"claude --resume {session_id}"
+
+
+def local_date(value: datetime) -> date:
+    return value.astimezone().date()
+
+
+def source_label(source: str) -> str:
+    if source == "codex":
+        return "Codex"
+    return "Claude"
+
+
+def project_name_from_cwd(cwd: str) -> str:
+    if not cwd:
+        return "(unknown)"
+    path = Path(cwd).expanduser()
+    name = path.name.strip()
+    return name or str(path)
+
+
+def is_codex_meta_text(text: str) -> bool:
+    stripped = text.strip()
+    return stripped.startswith("<environment_context>") or stripped.startswith("<turn_aborted>")
+
+
+def load_claude_session(path: Path) -> Optional[SessionEntry]:
     try:
         stat = path.stat()
     except OSError:
@@ -213,7 +278,7 @@ def load_session(path: Path) -> Optional[SessionEntry]:
                     continue
 
                 content = (item.get("message") or {}).get("content")
-                text = normalize_whitespace(" ".join(collect_text_blocks(content)))
+                text = normalize_whitespace(" ".join(collect_claude_text_blocks(content)))
                 if not text:
                     continue
                 messages.append(MessageEntry(role=record_type, text=text, timestamp=record_time))
@@ -221,17 +286,103 @@ def load_session(path: Path) -> Optional[SessionEntry]:
         return None
 
     return SessionEntry(
+        source="claude",
         session_id=session_id,
         project=project,
         path=path,
         title=title or fallback_title(session_id, last_prompt, messages),
         updated_at=updated_at,
+        resume_command=build_resume_command("claude", session_id),
         last_prompt=last_prompt,
         messages=messages,
     )
 
 
-def iter_sessions(root: Path, project_filter: Optional[str]) -> Iterable[SessionEntry]:
+def load_codex_session(path: Path) -> Optional[SessionEntry]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    session_id = path.stem
+    fallback_time = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).astimezone()
+    updated_at = fallback_time
+    title = ""
+    last_prompt = ""
+    cwd = ""
+    messages: list[MessageEntry] = []
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                record_time = parse_timestamp(item.get("timestamp"))
+                if record_time and record_time > updated_at:
+                    updated_at = record_time
+
+                record_type = item.get("type")
+                payload = item.get("payload") or {}
+
+                if record_type == "session_meta":
+                    payload_id = payload.get("id")
+                    if isinstance(payload_id, str) and payload_id:
+                        session_id = payload_id
+                    payload_time = parse_timestamp(payload.get("timestamp"))
+                    if payload_time and payload_time > updated_at:
+                        updated_at = payload_time
+                    value = payload.get("cwd")
+                    if isinstance(value, str) and value.strip():
+                        cwd = value.strip()
+                    continue
+
+                if record_type != "response_item":
+                    continue
+                if payload.get("type") != "message":
+                    continue
+
+                role = payload.get("role")
+                if role not in {"user", "assistant"}:
+                    continue
+
+                text = normalize_whitespace(
+                    " ".join(collect_codex_text_blocks(payload.get("content")))
+                )
+                if not text:
+                    continue
+                if is_codex_meta_text(text):
+                    continue
+
+                if role == "user" and not last_prompt:
+                    last_prompt = text
+                if role == "user" and not title:
+                    title = truncate_plain(text, 56)
+                messages.append(MessageEntry(role=role, text=text, timestamp=record_time))
+    except OSError:
+        return None
+
+    project = project_name_from_cwd(cwd)
+    return SessionEntry(
+        source="codex",
+        session_id=session_id,
+        project=project,
+        path=path,
+        title=title or fallback_title(session_id, last_prompt, messages),
+        updated_at=updated_at,
+        resume_command=build_resume_command("codex", session_id),
+        cwd=cwd,
+        last_prompt=last_prompt,
+        messages=messages,
+    )
+
+
+def iter_claude_sessions(root: Path, project_filter: Optional[str]) -> Iterable[SessionEntry]:
     if not root.exists():
         return
 
@@ -239,11 +390,39 @@ def iter_sessions(root: Path, project_filter: Optional[str]) -> Iterable[Session
     for path in sorted(root.rglob("*.jsonl")):
         if not path.is_file():
             continue
-        if project_match and project_match not in path.parent.name.casefold():
+        session = load_claude_session(path)
+        if not session:
             continue
-        session = load_session(path)
-        if session:
-            yield session
+        if project_match and project_match not in session.project.casefold():
+            continue
+        yield session
+
+
+def iter_codex_sessions(root: Path, project_filter: Optional[str]) -> Iterable[SessionEntry]:
+    if not root.exists():
+        return
+
+    project_match = project_filter.casefold() if project_filter else None
+    for path in sorted(root.rglob("*.jsonl")):
+        if not path.is_file():
+            continue
+        session = load_codex_session(path)
+        if not session:
+            continue
+        if project_match:
+            haystacks = [session.project.casefold(), session.cwd.casefold()]
+            if not any(project_match in item for item in haystacks if item):
+                continue
+        yield session
+
+
+def iter_sessions(
+    source: str, claude_root: Path, codex_root: Path, project_filter: Optional[str]
+) -> Iterable[SessionEntry]:
+    if source in {"all", "claude"}:
+        yield from iter_claude_sessions(claude_root, project_filter)
+    if source in {"all", "codex"}:
+        yield from iter_codex_sessions(codex_root, project_filter)
 
 
 def compile_pattern(query: str) -> re.Pattern[str]:
@@ -268,24 +447,20 @@ def build_snippet(text: str, pattern: re.Pattern[str], colors: bool) -> str:
     return pattern.sub(repl, snippet)
 
 
-def format_time(value: datetime) -> str:
-    return value.astimezone().strftime("%Y-%m-%d %H:%M")
-
-
 def session_to_dict(session: SessionEntry) -> dict[str, object]:
     return {
+        "source": session.source,
+        "source_display": source_label(session.source),
         "session_id": session.session_id,
         "project": session.project,
+        "cwd": session.cwd,
         "path": str(session.path),
         "title": session.title,
         "updated_at": session.updated_at.astimezone().isoformat(),
         "updated_at_display": format_time(session.updated_at),
         "last_prompt": session.last_prompt,
+        "resume_command": session.resume_command,
     }
-
-
-def local_date(value: datetime) -> date:
-    return value.astimezone().date()
 
 
 def filter_by_date(sessions: list[SessionEntry], date_text: Optional[str]) -> list[SessionEntry]:
@@ -299,10 +474,13 @@ def print_session_header(
     session: SessionEntry, index: int, total: int, colors: bool, show_path: bool
 ) -> None:
     print(colorize(f"[{index}/{total}] {session.title}", "1;36", colors))
+    print(f"  Source:  {source_label(session.source)}")
     print(f"  Time:    {format_time(session.updated_at)}")
     print(f"  Project: {session.project}")
+    if session.cwd:
+        print(f"  Cwd:     {session.cwd}")
     print(f"  Session: {session.session_id}")
-    print(f"  Resume:  claude --resume {session.session_id}")
+    print(f"  Resume:  {session.resume_command}")
     if show_path:
         print(f"  Path:    {session.path}")
 
@@ -321,6 +499,8 @@ def list_session_rows(
         or pattern.search(session.last_prompt)
         or pattern.search(session.session_id)
         or pattern.search(session.project)
+        or pattern.search(session.source)
+        or (session.cwd and pattern.search(session.cwd))
     ]
 
 
@@ -337,6 +517,7 @@ def search_session_rows(
         header_sources = [
             ("title", session.title),
             ("prompt", session.last_prompt),
+            ("cwd", session.cwd),
         ]
         for label, text in header_sources:
             if text and pattern.search(text):
@@ -432,9 +613,10 @@ def search_sessions(sessions: list[SessionEntry], args: argparse.Namespace, colo
 
 def main() -> int:
     args = parse_args()
-    root = Path(args.root).expanduser()
     colors = use_color(args)
-    sessions = list(iter_sessions(root, args.project))
+    claude_root = Path(args.claude_root or args.root).expanduser()
+    codex_root = Path(args.codex_root or DEFAULT_CODEX_ROOT).expanduser()
+    sessions = list(iter_sessions(args.source, claude_root, codex_root, args.project))
     sessions = filter_by_date(sessions, args.date)
     sessions.sort(key=lambda item: item.updated_at, reverse=True)
 

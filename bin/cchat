@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""macOS popup helper for searching and resuming Claude Code sessions."""
+"""macOS popup helper for searching and resuming Claude Code and Codex sessions."""
 
 from __future__ import annotations
 
@@ -18,20 +18,23 @@ PREVIEW_LIMIT = 320
 GUI_FLAGS = {"--popup", "--gui"}
 HELP_FLAGS = {"-h", "--help"}
 
-HELP_TEXT = """cchat: Claude Code session search helper
+HELP_TEXT = """cchat: Claude Code + Codex session search helper
 
 Usage:
   cchat                     Open the macOS popup UI
-  cchat "keyword"           Search sessions in the terminal
+  cchat "keyword"           Search Claude Code and Codex sessions in the terminal
   cchat --list              List recent sessions in the terminal
   cchat --date YYYY-MM-DD --list
                             List sessions from a specific date
+  cchat --source codex --list
+                            Only list Codex sessions
   cchat --popup             Force popup mode
   cchat --popup "keyword"   Open popup mode with a prefilled keyword
 
 Notes:
   - cchat is the main command you need to remember.
   - The terminal mode forwards options to the internal search engine.
+  - By default it searches both Claude Code and Codex sessions.
   - For full structured output, you can still use: cchat --json ...
 """
 
@@ -40,7 +43,7 @@ on run argv
     set defaultText to ""
     if (count of argv) > 0 then set defaultText to item 1 of argv
     try
-        set dialogResult to display dialog "输入关键词后点搜索；如果想看最近聊天或按日期查看，请点更多方式。" with title "Claude Session 搜索" default answer defaultText buttons {"取消", "更多方式", "搜索"} default button "搜索"
+        set dialogResult to display dialog "输入关键词后点搜索；如果想看最近聊天或按日期查看，请点更多方式。默认会同时搜索 Claude Code 和 Codex。" with title "AI Session 搜索" default answer defaultText buttons {"取消", "更多方式", "搜索"} default button "搜索"
         return (button returned of dialogResult) & linefeed & (text returned of dialogResult)
     on error number -128
         return "__CANCEL__"
@@ -51,7 +54,7 @@ end run
 MODE_DIALOG = r'''
 on run argv
     try
-        set dialogResult to display dialog "选择查看方式：" with title "Claude Session 搜索" buttons {"取消", "最近聊天", "按日期"} default button "最近聊天"
+        set dialogResult to display dialog "选择查看方式：" with title "AI Session 搜索" buttons {"取消", "最近聊天", "按日期"} default button "最近聊天"
         return button returned of dialogResult
     on error number -128
         return "__CANCEL__"
@@ -64,7 +67,7 @@ on run argv
     set defaultDate to ""
     if (count of argv) > 0 then set defaultDate to item 1 of argv
     try
-        set dialogResult to display dialog "输入要查看的日期（YYYY-MM-DD）。留空则使用今天。" with title "按日期查看 Claude Session" default answer defaultDate buttons {"取消", "今天", "查看"} default button "查看"
+        set dialogResult to display dialog "输入要查看的日期（YYYY-MM-DD）。留空则使用今天。" with title "按日期查看 AI Session" default answer defaultDate buttons {"取消", "今天", "查看"} default button "查看"
         set btn to button returned of dialogResult
         set valueText to text returned of dialogResult
         if btn is "今天" then
@@ -81,7 +84,7 @@ PICK_DIALOG = r'''
 on run argv
     if (count of argv) = 0 then return "__CANCEL__"
     try
-        set picked to choose from list argv with title "Claude Session 列表" with prompt "选择一个聊天记录：" OK button name "查看详情" cancel button name "取消" without multiple selections allowed and empty selection allowed
+        set picked to choose from list argv with title "AI Session 列表" with prompt "选择一个聊天记录：" OK button name "查看详情" cancel button name "取消" without multiple selections allowed and empty selection allowed
         if picked is false then return "__CANCEL__"
         return item 1 of picked
     on error number -128
@@ -94,7 +97,7 @@ DETAIL_DIALOG = r'''
 on run argv
     set detailText to item 1 of argv
     try
-        set dialogResult to display dialog detailText with title "Claude Session 详情" buttons {"取消", "复制恢复命令", "在终端打开"} default button "在终端打开"
+        set dialogResult to display dialog detailText with title "AI Session 详情" buttons {"取消", "复制恢复命令", "在终端打开"} default button "在终端打开"
         return button returned of dialogResult
     on error number -128
         return "__CANCEL__"
@@ -116,7 +119,7 @@ end run
 ALERT_DIALOG = r'''
 on run argv
     set alertText to item 1 of argv
-    display dialog alertText with title "Claude Session 搜索" buttons {"好"} default button "好"
+    display dialog alertText with title "AI Session 搜索" buttons {"好"} default button "好"
     return "OK"
 end run
 '''
@@ -199,18 +202,26 @@ def build_choice(index: int, item: dict[str, object]) -> str:
     updated = item.get("updated_at_display", "")
     title = truncate(item.get("title", ""), TITLE_LIMIT)
     project = item.get("project", "")
-    return f"{index:02d}. {updated} | {title} | {project}"
+    source = item.get("source_display") or item.get("source") or "unknown"
+    return f"{index:02d}. [{source}] {updated} | {title} | {project}"
 
 
 def build_detail(item: dict[str, object], query: str, list_mode: bool) -> str:
     lines = [
         f"标题: {item.get('title', '')}",
+        f"来源: {item.get('source_display', item.get('source', ''))}",
         f"时间: {item.get('updated_at_display', '')}",
         f"项目: {item.get('project', '')}",
+        (
+            f"目录: {item.get('cwd', '')}"
+            if item.get("cwd")
+            else None
+        ),
         f"Session: {item.get('session_id', '')}",
-        f"恢复命令: claude --resume {item.get('session_id', '')}",
+        f"恢复命令: {item.get('resume_command', '')}",
         "",
     ]
+    lines = [line for line in lines if line is not None]
 
     snippets = item.get("snippets") or []
     if snippets:
@@ -248,7 +259,6 @@ def choose_date(default_text: str) -> str | None:
 
 def popup_main(default_query: str) -> int:
     csearch = find_binary("csearch", Path.home() / ".local" / "bin" / "csearch")
-    claude = find_binary("claude", Path.home() / ".local" / "bin" / "claude")
 
     answer = run_applescript(INPUT_DIALOG, default_query)
     if answer is None:
@@ -296,7 +306,7 @@ def popup_main(default_query: str) -> int:
     if follow_up is None or follow_up == "取消":
         return 0
 
-    resume_cmd = f"{claude} --resume {selected.get('session_id', '')}"
+    resume_cmd = str(selected.get("resume_command", "")).strip()
     if follow_up == "复制恢复命令":
         subprocess.run(["pbcopy"], input=resume_cmd, text=True, check=False)
         run_applescript(ALERT_DIALOG, "恢复命令已经复制到剪贴板。")
