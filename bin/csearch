@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+"""Search and preview Claude Code session transcripts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Iterable, Optional
+
+DEFAULT_ROOT = Path.home() / ".claude" / "projects"
+DEFAULT_MAX_RESULTS = 10
+DEFAULT_SNIPPETS = 3
+SNIPPET_WIDTH = 72
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+@dataclass
+class MessageEntry:
+    role: str
+    text: str
+    timestamp: Optional[datetime] = None
+
+
+@dataclass
+class SessionEntry:
+    session_id: str
+    project: str
+    path: Path
+    title: str
+    updated_at: datetime
+    last_prompt: str = ""
+    messages: list[MessageEntry] = field(default_factory=list)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog=os.environ.get("CSEARCH_PROG", "csearch"),
+        description="Search and preview Claude Code session JSONL files."
+    )
+    parser.add_argument("query", nargs="?", help="Search text.")
+    parser.add_argument(
+        "--root",
+        default=str(DEFAULT_ROOT),
+        help="Claude projects root directory. Default: ~/.claude/projects",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List sessions instead of searching message contents.",
+    )
+    parser.add_argument(
+        "--project",
+        help="Only include project directories whose name contains this text.",
+    )
+    parser.add_argument(
+        "--max",
+        type=int,
+        default=DEFAULT_MAX_RESULTS,
+        help=f"Maximum sessions to print. Default: {DEFAULT_MAX_RESULTS}",
+    )
+    parser.add_argument(
+        "--snippets",
+        type=int,
+        default=DEFAULT_SNIPPETS,
+        help=f"Maximum matching snippets to print per session. Default: {DEFAULT_SNIPPETS}",
+    )
+    parser.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI colors.",
+    )
+    parser.add_argument(
+        "--path",
+        action="store_true",
+        help="Show the JSONL path for each result.",
+    )
+    parser.add_argument(
+        "--date",
+        help="Only include sessions updated on this local date, format: YYYY-MM-DD",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print structured JSON instead of plain text.",
+    )
+    args = parser.parse_args()
+
+    if not args.list and not args.query:
+        parser.error("either provide a search query or use --list")
+    if args.max is not None and args.max < 1:
+        parser.error("--max must be >= 1")
+    if args.snippets is not None and args.snippets < 1:
+        parser.error("--snippets must be >= 1")
+    if args.date:
+        try:
+            datetime.strptime(args.date, "%Y-%m-%d")
+        except ValueError as exc:
+            parser.error(f"--date must be YYYY-MM-DD: {exc}")
+    return args
+
+
+def use_color(args: argparse.Namespace) -> bool:
+    return sys.stdout.isatty() and not args.no_color
+
+
+def colorize(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def normalize_whitespace(text: str) -> str:
+    return " ".join(str(text).split())
+
+
+def parse_timestamp(raw: object) -> Optional[datetime]:
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone()
+    except ValueError:
+        return None
+
+
+def collect_text_blocks(content: object) -> Iterable[str]:
+    if isinstance(content, str):
+        yield content
+        return
+
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    yield text
+        return
+
+    if isinstance(content, dict) and content.get("type") == "text":
+        text = content.get("text")
+        if isinstance(text, str) and text.strip():
+            yield text
+
+
+def fallback_title(session_id: str, last_prompt: str, messages: list[MessageEntry]) -> str:
+    if last_prompt:
+        return truncate_plain(last_prompt, 56)
+    if messages:
+        return truncate_plain(messages[0].text, 56)
+    return f"(untitled) {session_id[:8]}"
+
+
+def truncate_plain(text: str, limit: int) -> str:
+    text = normalize_whitespace(text)
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 1)] + "…"
+
+
+def load_session(path: Path) -> Optional[SessionEntry]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    project = path.parent.name
+    session_id = path.stem
+    fallback_time = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).astimezone()
+    updated_at = fallback_time
+    title = ""
+    last_prompt = ""
+    messages: list[MessageEntry] = []
+
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                record_type = item.get("type")
+                record_time = parse_timestamp(item.get("timestamp"))
+                if record_time and record_time > updated_at:
+                    updated_at = record_time
+
+                if record_type == "custom-title":
+                    value = normalize_whitespace(item.get("customTitle", ""))
+                    if value:
+                        title = value
+                    continue
+
+                if record_type == "last-prompt":
+                    value = normalize_whitespace(item.get("lastPrompt", ""))
+                    if value:
+                        last_prompt = value
+                    continue
+
+                if record_type not in {"user", "assistant"}:
+                    continue
+
+                if item.get("isMeta"):
+                    continue
+
+                content = (item.get("message") or {}).get("content")
+                text = normalize_whitespace(" ".join(collect_text_blocks(content)))
+                if not text:
+                    continue
+                messages.append(MessageEntry(role=record_type, text=text, timestamp=record_time))
+    except OSError:
+        return None
+
+    return SessionEntry(
+        session_id=session_id,
+        project=project,
+        path=path,
+        title=title or fallback_title(session_id, last_prompt, messages),
+        updated_at=updated_at,
+        last_prompt=last_prompt,
+        messages=messages,
+    )
+
+
+def iter_sessions(root: Path, project_filter: Optional[str]) -> Iterable[SessionEntry]:
+    if not root.exists():
+        return
+
+    project_match = project_filter.casefold() if project_filter else None
+    for path in sorted(root.rglob("*.jsonl")):
+        if not path.is_file():
+            continue
+        if project_match and project_match not in path.parent.name.casefold():
+            continue
+        session = load_session(path)
+        if session:
+            yield session
+
+
+def compile_pattern(query: str) -> re.Pattern[str]:
+    return re.compile(re.escape(query), re.IGNORECASE)
+
+
+def build_snippet(text: str, pattern: re.Pattern[str], colors: bool) -> str:
+    text = normalize_whitespace(text)
+    match = pattern.search(text)
+    if not match:
+        return truncate_plain(text, SNIPPET_WIDTH * 2)
+
+    start = max(0, match.start() - SNIPPET_WIDTH)
+    end = min(len(text), match.end() + SNIPPET_WIDTH)
+    prefix = "…" if start > 0 else ""
+    suffix = "…" if end < len(text) else ""
+    snippet = prefix + text[start:end] + suffix
+
+    def repl(found: re.Match[str]) -> str:
+        return colorize(found.group(0), "1;31", colors)
+
+    return pattern.sub(repl, snippet)
+
+
+def format_time(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def session_to_dict(session: SessionEntry) -> dict[str, object]:
+    return {
+        "session_id": session.session_id,
+        "project": session.project,
+        "path": str(session.path),
+        "title": session.title,
+        "updated_at": session.updated_at.astimezone().isoformat(),
+        "updated_at_display": format_time(session.updated_at),
+        "last_prompt": session.last_prompt,
+    }
+
+
+def local_date(value: datetime) -> date:
+    return value.astimezone().date()
+
+
+def filter_by_date(sessions: list[SessionEntry], date_text: Optional[str]) -> list[SessionEntry]:
+    if not date_text:
+        return list(sessions)
+    target = datetime.strptime(date_text, "%Y-%m-%d").date()
+    return [session for session in sessions if local_date(session.updated_at) == target]
+
+
+def print_session_header(
+    session: SessionEntry, index: int, total: int, colors: bool, show_path: bool
+) -> None:
+    print(colorize(f"[{index}/{total}] {session.title}", "1;36", colors))
+    print(f"  Time:    {format_time(session.updated_at)}")
+    print(f"  Project: {session.project}")
+    print(f"  Session: {session.session_id}")
+    print(f"  Resume:  claude --resume {session.session_id}")
+    if show_path:
+        print(f"  Path:    {session.path}")
+
+
+def list_session_rows(
+    sessions: list[SessionEntry], query: Optional[str]
+) -> list[SessionEntry]:
+    if not query:
+        return list(sessions)
+
+    pattern = compile_pattern(query)
+    return [
+        session
+        for session in sessions
+        if pattern.search(session.title)
+        or pattern.search(session.last_prompt)
+        or pattern.search(session.session_id)
+        or pattern.search(session.project)
+    ]
+
+
+def search_session_rows(
+    sessions: list[SessionEntry], query: str, snippets_limit: int, colors: bool
+) -> list[tuple[SessionEntry, list[tuple[str, str]]]]:
+    pattern = compile_pattern(query)
+    matches: list[tuple[SessionEntry, list[tuple[str, str]]]] = []
+
+    for session in sessions:
+        snippets: list[tuple[str, str]] = []
+        seen_keys: set[tuple[str, str]] = set()
+
+        header_sources = [
+            ("title", session.title),
+            ("prompt", session.last_prompt),
+        ]
+        for label, text in header_sources:
+            if text and pattern.search(text):
+                snippet = build_snippet(text, pattern, colors)
+                key = (label, ANSI_RE.sub("", snippet))
+                if key not in seen_keys:
+                    snippets.append((label, snippet))
+                    seen_keys.add(key)
+                if len(snippets) >= snippets_limit:
+                    break
+
+        if len(snippets) < snippets_limit:
+            for message in session.messages:
+                if not pattern.search(message.text):
+                    continue
+                label = "user" if message.role == "user" else "assistant"
+                snippet = build_snippet(message.text, pattern, colors)
+                key = (label, ANSI_RE.sub("", snippet))
+                if key in seen_keys:
+                    continue
+                snippets.append((label, snippet))
+                seen_keys.add(key)
+                if len(snippets) >= snippets_limit:
+                    break
+
+        if snippets:
+            matches.append((session, snippets))
+
+    matches.sort(key=lambda item: item[0].updated_at, reverse=True)
+    return matches
+
+
+def list_sessions(sessions: list[SessionEntry], args: argparse.Namespace, colors: bool) -> int:
+    filtered = list_session_rows(sessions, args.query)
+    filtered.sort(key=lambda item: item.updated_at, reverse=True)
+    limited = filtered[: args.max]
+    if not limited:
+        if args.json:
+            print("[]")
+        else:
+            print("No sessions found.")
+        return 1
+
+    if args.json:
+        print(
+            json.dumps(
+                [session_to_dict(session) for session in limited],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    for idx, session in enumerate(limited, start=1):
+        if idx > 1:
+            print()
+        print_session_header(session, idx, len(limited), colors, args.path)
+        if session.last_prompt:
+            print(f"  Prompt:  {truncate_plain(session.last_prompt, 100)}")
+    return 0
+
+
+def search_sessions(sessions: list[SessionEntry], args: argparse.Namespace, colors: bool) -> int:
+    matches = search_session_rows(sessions, args.query, args.snippets, colors)
+    limited = matches[: args.max]
+    if not limited:
+        if args.json:
+            print("[]")
+        else:
+            print(f'No matches for "{args.query}".')
+        return 1
+
+    if args.json:
+        payload = []
+        for session, snippets in limited:
+            item = session_to_dict(session)
+            item["snippets"] = [
+                {"label": label, "text": ANSI_RE.sub("", snippet)}
+                for label, snippet in snippets
+            ]
+            payload.append(item)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    for idx, (session, snippets) in enumerate(limited, start=1):
+        if idx > 1:
+            print()
+        print_session_header(session, idx, len(limited), colors, args.path)
+        for label, snippet in snippets:
+            print(f"  {label:>9}: {snippet}")
+    return 0
+
+
+def main() -> int:
+    args = parse_args()
+    root = Path(args.root).expanduser()
+    colors = use_color(args)
+    sessions = list(iter_sessions(root, args.project))
+    sessions = filter_by_date(sessions, args.date)
+    sessions.sort(key=lambda item: item.updated_at, reverse=True)
+
+    if args.list:
+        return list_sessions(sessions, args, colors)
+    return search_sessions(sessions, args, colors)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

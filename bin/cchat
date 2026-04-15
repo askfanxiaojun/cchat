@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""macOS popup helper for searching and resuming Claude Code sessions."""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+MAX_RESULTS = 40
+SNIPPETS = 2
+TITLE_LIMIT = 44
+PREVIEW_LIMIT = 320
+GUI_FLAGS = {"--popup", "--gui"}
+HELP_FLAGS = {"-h", "--help"}
+
+HELP_TEXT = """cchat: Claude Code session search helper
+
+Usage:
+  cchat                     Open the macOS popup UI
+  cchat "keyword"           Search sessions in the terminal
+  cchat --list              List recent sessions in the terminal
+  cchat --date YYYY-MM-DD --list
+                            List sessions from a specific date
+  cchat --popup             Force popup mode
+  cchat --popup "keyword"   Open popup mode with a prefilled keyword
+
+Notes:
+  - cchat is the main command you need to remember.
+  - The terminal mode forwards options to the internal search engine.
+  - For full structured output, you can still use: cchat --json ...
+"""
+
+INPUT_DIALOG = r'''
+on run argv
+    set defaultText to ""
+    if (count of argv) > 0 then set defaultText to item 1 of argv
+    try
+        set dialogResult to display dialog "输入关键词后点搜索；如果想看最近聊天或按日期查看，请点更多方式。" with title "Claude Session 搜索" default answer defaultText buttons {"取消", "更多方式", "搜索"} default button "搜索"
+        return (button returned of dialogResult) & linefeed & (text returned of dialogResult)
+    on error number -128
+        return "__CANCEL__"
+    end try
+end run
+'''
+
+MODE_DIALOG = r'''
+on run argv
+    try
+        set dialogResult to display dialog "选择查看方式：" with title "Claude Session 搜索" buttons {"取消", "最近聊天", "按日期"} default button "最近聊天"
+        return button returned of dialogResult
+    on error number -128
+        return "__CANCEL__"
+    end try
+end run
+'''
+
+DATE_DIALOG = r'''
+on run argv
+    set defaultDate to ""
+    if (count of argv) > 0 then set defaultDate to item 1 of argv
+    try
+        set dialogResult to display dialog "输入要查看的日期（YYYY-MM-DD）。留空则使用今天。" with title "按日期查看 Claude Session" default answer defaultDate buttons {"取消", "今天", "查看"} default button "查看"
+        set btn to button returned of dialogResult
+        set valueText to text returned of dialogResult
+        if btn is "今天" then
+            return "__TODAY__"
+        end if
+        return valueText
+    on error number -128
+        return "__CANCEL__"
+    end try
+end run
+'''
+
+PICK_DIALOG = r'''
+on run argv
+    if (count of argv) = 0 then return "__CANCEL__"
+    try
+        set picked to choose from list argv with title "Claude Session 列表" with prompt "选择一个聊天记录：" OK button name "查看详情" cancel button name "取消" without multiple selections allowed and empty selection allowed
+        if picked is false then return "__CANCEL__"
+        return item 1 of picked
+    on error number -128
+        return "__CANCEL__"
+    end try
+end run
+'''
+
+DETAIL_DIALOG = r'''
+on run argv
+    set detailText to item 1 of argv
+    try
+        set dialogResult to display dialog detailText with title "Claude Session 详情" buttons {"取消", "复制恢复命令", "在终端打开"} default button "在终端打开"
+        return button returned of dialogResult
+    on error number -128
+        return "__CANCEL__"
+    end try
+end run
+'''
+
+OPEN_TERMINAL = r'''
+on run argv
+    set resumeCmd to item 1 of argv
+    tell application "Terminal"
+        activate
+        do script resumeCmd
+    end tell
+    return "OK"
+end run
+'''
+
+ALERT_DIALOG = r'''
+on run argv
+    set alertText to item 1 of argv
+    display dialog alertText with title "Claude Session 搜索" buttons {"好"} default button "好"
+    return "OK"
+end run
+'''
+
+
+def bundled_binary(name: str) -> Path:
+    return Path(__file__).resolve().with_name(name)
+
+
+def find_binary(name: str, fallback: Path) -> str:
+    local = bundled_binary(name)
+    if local.exists():
+        return str(local)
+    return shutil.which(name) or str(fallback)
+
+
+def run_applescript(script: str, *args: str) -> str | None:
+    result = subprocess.run(
+        ["osascript", "-", *args],
+        input=script,
+        text=True,
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        if "(-128)" in stderr:
+            return None
+        raise RuntimeError(stderr or "osascript failed")
+    output = result.stdout.rstrip("\n")
+    if output == "__CANCEL__":
+        return None
+    return output
+
+
+def run_cli_mode(csearch: str, argv: list[str]) -> int:
+    env = os.environ.copy()
+    env["CSEARCH_PROG"] = "cchat"
+    result = subprocess.run([csearch, *argv], env=env)
+    return result.returncode
+
+
+def truncate(text: str, limit: int) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)] + "…"
+
+
+def run_csearch(
+    csearch: str, query: str, list_mode: bool, date_text: str = ""
+) -> list[dict[str, object]]:
+    cmd = [
+        csearch,
+        "--json",
+        "--no-color",
+        "--max",
+        str(MAX_RESULTS),
+        "--snippets",
+        str(SNIPPETS),
+    ]
+    if date_text:
+        cmd.extend(["--date", date_text])
+    if list_mode:
+        cmd.append("--list")
+        if query:
+            cmd.append(query)
+    else:
+        cmd.append(query)
+
+    result = subprocess.run(cmd, text=True, capture_output=True)
+    stdout = result.stdout.strip()
+    if stdout:
+        return json.loads(stdout)
+    if result.returncode == 0:
+        return []
+    raise RuntimeError((result.stderr or "csearch failed").strip())
+
+
+def build_choice(index: int, item: dict[str, object]) -> str:
+    updated = item.get("updated_at_display", "")
+    title = truncate(item.get("title", ""), TITLE_LIMIT)
+    project = item.get("project", "")
+    return f"{index:02d}. {updated} | {title} | {project}"
+
+
+def build_detail(item: dict[str, object], query: str, list_mode: bool) -> str:
+    lines = [
+        f"标题: {item.get('title', '')}",
+        f"时间: {item.get('updated_at_display', '')}",
+        f"项目: {item.get('project', '')}",
+        f"Session: {item.get('session_id', '')}",
+        f"恢复命令: claude --resume {item.get('session_id', '')}",
+        "",
+    ]
+
+    snippets = item.get("snippets") or []
+    if snippets:
+        lines.append("预览:")
+        for snippet in snippets:
+            label = snippet.get("label", "")
+            text = truncate(snippet.get("text", ""), PREVIEW_LIMIT)
+            lines.append(f"[{label}] {text}")
+    elif item.get("last_prompt"):
+        lines.append("最近提示:")
+        lines.append(truncate(item.get("last_prompt", ""), PREVIEW_LIMIT))
+    elif list_mode:
+        lines.append("这个会话目前没有可展示的预览内容。")
+    else:
+        lines.append(f'没有找到和 "{query}" 对应的预览片段。')
+
+    return "\n".join(lines)
+
+
+def choose_date(default_text: str) -> str | None:
+    result = run_applescript(DATE_DIALOG, default_text)
+    if result is None:
+        return None
+    if result == "__TODAY__" or not result.strip():
+        return datetime.now().astimezone().strftime("%Y-%m-%d")
+
+    date_text = result.strip()
+    try:
+        datetime.strptime(date_text, "%Y-%m-%d")
+    except ValueError:
+        run_applescript(ALERT_DIALOG, "日期格式不对，请使用 YYYY-MM-DD。")
+        return choose_date(default_text)
+    return date_text
+
+
+def popup_main(default_query: str) -> int:
+    csearch = find_binary("csearch", Path.home() / ".local" / "bin" / "csearch")
+    claude = find_binary("claude", Path.home() / ".local" / "bin" / "claude")
+
+    answer = run_applescript(INPUT_DIALOG, default_query)
+    if answer is None:
+        return 0
+
+    parts = answer.splitlines()
+    action = parts[0].strip() if parts else "搜索"
+    query = parts[1].strip() if len(parts) > 1 else default_query
+    if action == "更多方式":
+        action = run_applescript(MODE_DIALOG) or "取消"
+        if action == "取消":
+            return 0
+    date_text = ""
+    if action == "按日期":
+        date_text = choose_date(datetime.now().astimezone().strftime("%Y-%m-%d"))
+        if date_text is None:
+            return 0
+    list_mode = action == "最近聊天" or not query
+    if action == "按日期":
+        list_mode = True
+
+    try:
+        items = run_csearch(csearch, query, list_mode=list_mode, date_text=date_text)
+    except Exception as exc:  # noqa: BLE001
+        run_applescript(ALERT_DIALOG, f"读取聊天记录失败：{exc}")
+        return 1
+
+    if not items:
+        if date_text:
+            message = f"没有找到 {date_text} 这一天的聊天记录。"
+        else:
+            message = "没有找到最近聊天记录。" if list_mode else f'没有找到包含“{query}”的聊天记录。'
+        run_applescript(ALERT_DIALOG, message)
+        return 0
+
+    choices = [build_choice(idx, item) for idx, item in enumerate(items, start=1)]
+    chosen = run_applescript(PICK_DIALOG, *choices)
+    if chosen is None:
+        return 0
+
+    selected_index = choices.index(chosen)
+    selected = items[selected_index]
+    detail = build_detail(selected, query, list_mode)
+    follow_up = run_applescript(DETAIL_DIALOG, detail)
+    if follow_up is None or follow_up == "取消":
+        return 0
+
+    resume_cmd = f"{claude} --resume {selected.get('session_id', '')}"
+    if follow_up == "复制恢复命令":
+        subprocess.run(["pbcopy"], input=resume_cmd, text=True, check=False)
+        run_applescript(ALERT_DIALOG, "恢复命令已经复制到剪贴板。")
+        return 0
+
+    if follow_up == "在终端打开":
+        run_applescript(OPEN_TERMINAL, resume_cmd)
+    return 0
+
+
+def main() -> int:
+    csearch = find_binary("csearch", Path.home() / ".local" / "bin" / "csearch")
+    argv = sys.argv[1:]
+
+    if not argv:
+        return popup_main("")
+
+    if argv[0] in HELP_FLAGS:
+        print(HELP_TEXT)
+        return 0
+
+    if argv[0] in GUI_FLAGS:
+        return popup_main(" ".join(argv[1:]).strip())
+
+    return run_cli_mode(csearch, argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
